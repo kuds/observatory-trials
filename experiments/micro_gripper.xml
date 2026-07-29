@@ -1,0 +1,17 @@
+<mujoco model="micro_gripper">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="carriage" pos="0 0 0">
+      <joint name="lift" type="slide" axis="0 0 1" range="-1 1"/>
+      <inertial pos="0 0 0" mass="CARMASS" diaginertia="CARIN CARIN CARIN"/>
+      <body name="jaw_l" pos="0 0 0">
+        <joint name="jl" type="slide" axis="0 1 0" range="-1 1"/>
+        <geom name="gl" type="box" size="JAWX JAWT JAWZ" pos="0 JAWOFF 0" rgba="0.2 0.4 0.9 1"/>
+      </body>
+      <body name="jaw_r" pos="0 0 0">
+        <joint name="jr" type="slide" axis="0 -1 0" range="-1 1"/>
+        <geom name="gr" type="box" size="JAWX JAWT JAWZ" pos="0 -JAWOFF 0" rgba="0.9 0.4 0.2 1"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

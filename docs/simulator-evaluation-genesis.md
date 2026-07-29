@@ -1,372 +1,390 @@
-# Genesis as the simulator for fine / nimble grasping
+# Simulator selection for micro-manipulation (watch assembly)
 
 **Status:** evaluation, not a decision. July 2026.
-**Scope:** whether the Genesis simulation environment is a good option for the
-fine-grained, nimble grasping tier of this project.
+**Scope:** choosing a simulation environment for fine-grained *micro*-manipulation
+— watch-building-class assembly of sub-millimetre to few-millimetre components.
+Genesis is the primary candidate under review; MuJoCo, Isaac Lab + Newton, and
+Drake are the comparators.
+
+> **Revision note.** An earlier draft of this document evaluated Genesis for
+> "fine grasping" generically. The scope was then clarified to *micro*-manipulation
+> at watch-component scale. That change is material — it weakens the strongest
+> original argument for Genesis (batched tactile arrays) and promotes a candidate
+> the first draft under-weighted (Drake). §3 and §7 are the revised conclusions.
 
 ---
 
-## 0. A note on the plan
+## 0. On the plan
 
-There is no plan in this repository. `main` contains a single commit whose only
-content is a one-line `README.md` (`# observatory-trials`). There are no issues,
-no pull requests, no design docs, and no other branches carrying content. I also
-searched the connected Drive for a simulator/platform plan and found nothing
-matching.
+There is no plan in this repository. `main` is a single commit containing a
+one-line `README.md`. No issues, no PRs, no design docs, no other content-carrying
+branches; nothing matching in the connected Drive either. So this document does
+not review a proposed shortlist — it builds one.
 
-So this document does **not** review a proposed set of simulation options — it
-can't. Instead it evaluates Genesis on its merits for fine grasping, against the
-alternatives a project like this would realistically be choosing among, and
-states its assumptions explicitly:
+Working assumptions, to be corrected if wrong:
 
-- **A1** — there is a "bulk" tier (locomotion / pick-and-place / vision policies
-  trained at scale) and a "fine" tier (dexterous, contact-rich, tolerance-sensitive
-  grasping). This document is about the fine tier only.
-- **A2** — sim-to-real transfer to physical hardware is a goal, not just
-  in-sim benchmarking.
-- **A3** — GPU training capacity is available; the numbers below were measured
-  CPU-only and are not throughput guidance.
+- **A1** — target components are watch-scale: hairspring wire ~0.03 mm, pivots
+  ~0.07–0.12 mm, screws ~0.3–1.4 mm, jewels ~1–1.5 mm, wheels and balance
+  ~5–10 mm. So the workspace spans **roughly two and a half orders of magnitude**,
+  straddling the boundary where surface forces overtake gravity.
+- **A2** — end effector is tweezer- or micro-gripper-like under magnification,
+  not a multi-finger anthropomorphic hand.
+- **A3** — the goal is eventually sim-to-real, not sim-only benchmarking.
+- **A4** — motion is largely quasi-static and precision-dominated rather than
+  dynamic and throughput-dominated.
 
-If the actual plan says something different, the recommendation in §6 may change.
-Point me at it and I'll redo this against the real document.
-
----
-
-## 1. Verdict
-
-**Yes — Genesis is a good option for the fine grasping tier, but as a specialist
-second track, not as the program's backbone.**
-
-The reason to pick Genesis is *not* speed. In 2026 that argument is dead (§4.6).
-The reason is that Genesis is the only engine that puts **batched tactile
-sensing, intersection-free IPC contact, and rigid–deformable coupling in one
-scene with one state**. If the fine-grasping work is genuinely about tactile
-feedback, soft fingertips, or deformable objects, that combination does not exist
-elsewhere and is worth real integration cost.
-
-The reason to keep it off the critical path is maturity: the specific contact
-features that make it attractive for grasping are **weeks old**, and its grasp
-behavior is measurably sensitive to contact parameters (§4.1).
+**A2 and A4 are the assumptions most likely to change the answer.** If you
+actually intend multi-finger dexterous hands, or need massive-scale RL, §7 shifts
+back toward Genesis.
 
 ---
 
-## 2. What Genesis actually is, as of July 2026
+## 1. The finding that dominates everything else
 
-| | |
+**At watch-component scale, the physics that decides success is not the physics
+these simulators model.**
+
+Below roughly 100 µm, van der Waals, capillary, and electrostatic forces dominate
+part interactions; for a 1 µm particle, adhesion exceeds gravity by a factor of
+>10⁶. The practical consequence is the **release problem**, a long-standing
+open challenge in micromanipulation: picking a micro-part up is easy, *putting it
+down where you want it* is not, because it clings to the tool. Any watchmaker
+recognizes this — the part vanishes onto the tweezers, or pings off the bench.
+
+**None of Genesis, MuJoCo, Isaac Lab, or Drake model adhesion, capillary bridging,
+or electrostatics.** All four model gravity, contact, and friction. Out of the
+box, **every candidate simulates the wrong dominant physics** for the smaller end
+of your part range.
+
+This reframes the selection criteria. The top question is no longer "which engine
+has the best contact solver?" It is:
+
+> **Which engine will let me inject a custom adhesion/capillary force model and
+> calibrate it against real hardware?**
+
+Contact fidelity still matters — it decides whether the 1–10 mm components
+(wheels, jewels, screws, plates) behave — but for anything below ~0.1 mm, a
+stock simulator will be confidently wrong regardless of which one you choose.
+
+---
+
+## 2. Measured: where Genesis actually breaks at small scale
+
+I installed `genesis-world==1.3.0` (CPU, Python 3.11, torch 2.13) and ran two
+experiments. Scripts are in [`experiments/`](../experiments/).
+
+### 2.1 Contact accuracy degrades as parts shrink
+
+An abstract two-jaw gripper closes on a cube and lifts it. Geometry is *identical
+in relative terms* at every scale — only absolute size changes. Penetration is
+reported as a **fraction of part size**, which is the number that matters: 0.05 mm
+of interpenetration is 0.1% of a 40 mm cube and irrelevant, but is the entire
+diameter of a watch pivot.
+
+| Part side | Max penetration (% of part) | Contacts |
+|---|---|---|
+| 40 mm | 5.1 % | 14 |
+| 10 mm | 8.1 % | 14 |
+| 4 mm | 16.6 % | 14 |
+| 1 mm | 22.7 % | 4 |
+| 0.3 mm | **model rejected — see 2.2** | — |
+
+Relative interpenetration grows monotonically as parts shrink, at fixed timestep.
+fp32 vs fp64 made no meaningful difference from 40 mm down to 4 mm.
+
+**It is recoverable, at a price.** Re-running the 1 mm case with a finer timestep:
+
+| Timestep | Max penetration (% of part) |
 |---|---|
-| Package | `genesis-world`, v1.3.0 (installed and tested below) |
-| Repo | `Genesis-Embodied-AI/genesis-world` |
-| License | Apache 2.0 |
-| Backing | started as an academic project (Dec 2024); development now officially supported by Genesis AI, the commercial entity behind the GENE-26.5 manipulation model |
-| Solvers | Rigid, FEM, MPM, Particle (PBD/SPH), `uipc` (IPC), SAP, plus an explicit coupler — all sharing one scene and one state |
-| Backends | CUDA, AMD ROCm, Apple Metal, Vulkan, x86, ARM64 via the Quadrants compiler |
+| 1/2000 s | 22.7 % |
+| 1/20 000 s | 2.7 % |
+| 1/100 000 s | 2.6 % |
 
-Note the naming collision: "Genesis" is both the open-source engine and the
-company (Genesis AI). Vendor performance claims about the platform are not the
-same thing as properties of the Apache-2.0 engine you would `pip install`.
+So accuracy is buyable with timestep — roughly **50× the compute** to bring a
+1 mm part back to the relative fidelity a 40 mm part gets for free. Any
+throughput projection for this project must be made at the timestep micro-parts
+actually require, not at default settings.
 
----
+### 2.2 A hard floor at ~0.3 mm: `mjMINVAL`
 
-## 3. Why it's a genuinely strong fit for fine grasping
-
-### 3.1 Tactile sensing is first-class, in-engine, and batched — the real differentiator
-
-This is the single strongest argument. Verified directly on the installed
-package — `gs.sensors` exposes, among others:
-
-`ContactForce`, `Contact`, `ContactProbe`, `ContactDepthProbe`,
-`ElastomerTaxel`, `KinematicTaxel`, `ProximityTaxel`, `SurfaceDistanceProbe`,
-`TemperatureGrid`, `JointTorque`, `IMU`, `Raycaster`, `Lidar`, `DepthCamera`
-
-— composed with `ViscoelasticHysteresisOptionsMixin` and
-`SpatialCrosstalkOptionsMixin`, i.e. the sensors model hysteresis and
-cross-taxel bleed rather than returning idealized contact values.
-
-The supporting result is *Tactile Genesis: Exploring Tactile Sensors at Scale for
-Learning Dexterous Tasks* (arXiv 2606.22332), which simulates seven tactile
-modalities — binary contact, contact depth, per-taxel force/torque, elastomer
-marker displacement, geometry-aware proximity, contact audio, temperature — across
-**20,000+ parallel environments**, trains dexterous policies on an XHand, and
-**transfers them to the real XHand1**. Its findings are directly actionable for a
-grasping program:
-
-- whole-hand sensor coverage substantially outperforms fingertip-only placement;
-- **per-taxel force/torque is consistently the most useful modality**;
-- resolution matters little — ~200 taxels across the hand suffices;
-- proprioception alone is insufficient on every task tested.
-
-Neither MuJoCo nor Isaac Lab offers this in-engine at this fidelity. In those
-stacks, taxel simulation is something you build and validate yourself.
-
-### 3.2 Intersection-free contact (IPC) with articulation coupled in
-
-Genesis World 1.0 added an **External Articulation Constraint** built on
-`libuipc` that embeds joint-space dynamics directly into IPC's optimization, so
-**joint-space forces and contact forces resolve simultaneously** rather than being
-staggered across separate solvers. A "barrier-free elastodynamics" formulation
-replaces IPC's logarithmic barrier with an augmented Lagrangian, reported at up to
-**103× faster than traditional IPC** in contact-heavy scenes while preserving
-intersection-free guarantees.
-
-For fine grasping this matters more than it sounds: intersection-free means thin
-objects and tight tolerances don't tunnel or interpenetrate, which is exactly the
-failure mode that makes precision grasping unreliable in penalty-based solvers.
-
-### 3.3 Rigid–deformable coupling in the same scene
-
-Soft fingertips, elastomer pads, cloth, cables, food. If any of these are in
-scope, having FEM/MPM/PBD coupled to the rigid solver in one state is a large
-practical saving over bolting a second simulator onto MuJoCo or Isaac.
-
-### 3.4 The recent solver work is precisely the grasping-relevant work
-
-The last three releases read like a fine-grasping changelog:
-
-- **v1.3.0** — torsional and rolling friction added to the rigid solver
-  (critical for in-hand rotation, pivoting, and rolling contacts); differentiable
-  rigid-body simulation promoted beyond experimental.
-- **v1.2.3** — elliptic friction cone with a high-impedance option to accurately
-  model **static friction**; constraint-solver convergence improved under fp32.
-- **v1.2.2** — realistic tactile sensor suite for RL; robust non-convex collision
-  detection fixing **spurious deep contacts and thin-shell tunneling**.
-
-This is a strong positive signal about direction — and simultaneously the
-maturity risk in §4.2, because it means these behaviors are new.
-
-### 3.5 Differentiability
-
-Differentiable rigid-body simulation is no longer experimental as of v1.3.0.
-Useful for grasp-pose optimization and, more valuably, for **system
-identification** — fitting friction and compliance parameters against real
-hardware logs rather than hand-tuning them.
-
-### 3.6 Apache 2.0
-
-Permissive, commercially usable, no negotiation needed.
-
----
-
-## 4. Where it will hurt
-
-### 4.1 Measured: grasp stability is sharply sensitive to grip force
-
-I installed `genesis-world==1.3.0` (CPU, Python 3.11, torch 2.13) and ran a
-Franka Panda pinch-grasp-and-lift on a 4 cm cube, sweeping only the gripper
-command. Script: [`experiments/genesis_grasp_smoke.py`](../experiments/genesis_grasp_smoke.py).
-
-| Gripper command | Contacts | Max penetration | Result |
-|---|---|---|---|
-| force, −0.5 N | 9 | 0.051 mm | **held**, lifted to z = 0.229 m |
-| force, −5.0 N | 6 | 0.139 mm | **ejected** — cube shot sideways |
-| position, 0.018 m | 12 | 0.035 mm | **ejected** |
-| position, 0.012 m | 12 | 0.074 mm | **held**, lifted to z = 0.230 m |
-
-Two readings, and both matter:
-
-**Good:** contact resolution is genuinely fine. Maximum penetration stayed
-between 0.03 and 0.14 mm on a 40 mm object — sub-0.4% of object scale. The engine
-resolves contact geometry well, and a correct grasp is rock-solid (lateral drift
-under 1 cm through a 23 cm lift).
-
-**Concerning:** a 10× increase in grip force flips a stable grasp into ejection.
-On real hardware, a Panda squeezing a 4 cm cube at 5 N holds it comfortably. This
-is squeeze-out instability, and there is a specific likely culprit — on load,
-Genesis warns:
+At 0.3 mm the model does not build at all:
 
 ```
-(MJCF) Approximating tendon by joint actuator for `finger_joint1`
-(MJCF) Approximating tendon by joint actuator for `finger_joint2`
+ValueError: Error: mass and inertia of moving bodies must be larger than mjMINVAL
+Element name 'carriage', id 1, line 5
 ```
 
-The Panda's fingers are mechanically coupled by a tendon; Genesis approximates
-this as two independent joint actuators. Decoupled fingers let asymmetric contact
-build a net lateral impulse that pops the object out. **For a program whose entire
-premise is fine grasping, characterizing this sensitivity is the first thing to
-do — not an afterthought.** It is very possibly tunable (friction, solver
-impedance, `condim`); it is not safe to assume so.
+Genesis parses MJCF through **MuJoCo's model compiler**, so it inherits MuJoCo's
+`mjMINVAL` floor (1e-15) on body mass and rotational inertia. A 0.3 mm steel
+component has inertia ≈ 2.9e-16 kg·m² — **below the floor**. In SI metres, watch
+parts are not representable.
 
-### 4.2 Version churn on exactly the features you'd depend on
+This is the single most actionable finding in this document, and it is **not
+Genesis-specific** — MuJoCo hits it identically, for the same reason.
 
-v1.0.0 shipped late May 2026; v1.3.0 in July 2026 — four minor releases in about
-two months, and the friction and contact semantics changed in three of them.
-Contact behavior *will* move under you. Pin an exact version, and treat a Genesis
-upgrade as an event that requires re-validating grasp policies, not a routine bump.
+**Consequence: unit rescaling is mandatory, not optional.** You must simulate in
+rescaled units (e.g. millimetres-as-metres, ×1000) and rescale gravity and time
+consistently to keep the dynamics right. This is a foundational decision that
+touches every asset, controller gain, and force reading in the project, so make
+it deliberately on day one rather than discovering it later.
 
-### 4.3 Known open contact bugs
+### 2.3 Honest limits of these measurements
 
-- Changing the friction vector reportedly does not affect contact behavior
-  (`Genesis` issue #1139) — near-zero friction and `condim` adjustments failed to
-  produce expected rotational slippage. If true and unresolved, that directly
-  undercuts friction-based grasp studies.
-- Gripper cannot maintain grasp on cloth; slipping (`genesis-world` issue #199).
+- The grasp **success/failure** column from my harness at 1 mm and at 1000 mm is
+  **confounded by my own controller-gain scaling** (gains scale with part mass and
+  become too weak at the small end). Do not read "failed to lift at 1 mm" as a
+  physics result. The penetration-versus-scale trend and the `mjMINVAL` floor are
+  the solid findings; the lift outcomes at the extremes are not.
+- CPU-only container, no GPU. No throughput guidance here.
+- An abstract jaw gripper is not a tweezer, and a cube is not a jewel.
 
-Both should be re-checked against 1.3.0 before committing.
+### 2.4 Carried over from the general-purpose evaluation
 
-### 4.4 Headless operation needs work
+Still relevant, measured on a Franka + 40 mm cube:
 
-`scene.build()` **unconditionally constructs the rasterizer** — "Rasterizer is
-always needed for depth and segmentation mask rendering" — even with
-`show_viewer=False` and no cameras added. On a GPU-less container this crashes in
-EGL init. Workaround: install `libosmesa6` and set `PYOPENGL_PLATFORM=osmesa`.
-Budget for this in CI and on headless cluster nodes.
-
-Also, scene build is slow: 10–90 s for a Franka + cube, dominated by convex
-decomposition of the robot meshes. Cache decompositions.
-
-### 4.5 Sim-to-real evidence is thinner and largely first-party
-
-Genesis AI reports 89% correlation between simulation and real-world rollouts and
-a 45% smaller reality-gap FID than alternatives. These are vendor-reported, on
-their own evaluation harness, for their platform. The strongest *independent-style*
-evidence for grasping specifically is the Tactile Genesis XHand transfer (§3.1) —
-real, but a narrow base compared to the years of published MuJoCo and Isaac
-manipulation transfer results.
-
-### 4.6 Speed is no longer a differentiator — and the old claims were overstated
-
-Genesis's headline "10–80× faster than Isaac Gym / MuJoCo" was criticized because
-the comparison was largely against **single-threaded MuJoCo and Isaac Gym, with
-MJX absent from the benchmark entirely** (see the DeepMind MuJoCo discussion
-#2303). Treat the historical throughput marketing as unreliable.
-
-More importantly, the landscape moved. **MuJoCo Warp** (MuJoCo 3.5) reports
-**252× faster locomotion and 475× faster manipulation than MJX** on an RTX PRO
-6000 Blackwell (152×/313× on a 4090), and **NVIDIA Newton 1.0 went GA at GTC
-2026** as a production-ready foundation for dexterous manipulation. Whatever
-throughput edge Genesis had in 2025 is gone.
-
-### 4.7 The tension nobody states out loud
-
-**Genesis's speed configuration and its fine-grasping-fidelity configuration are
-not the same configuration.** The eye-catching FPS numbers come from the rigid
-solver on simple scenes. The stack you actually want for nimble grasping — IPC
-contact, FEM deformables, per-taxel tactile with hysteresis — is a different and
-far more expensive path. Do not build a capacity plan that assumes you get both
-at once. Measure the fidelity configuration you'll actually train in.
-
-### 4.8 Ecosystem depth
-
-MuJoCo Playground, Isaac Lab, robosuite, and ManiSkill have far more ready-made
-manipulation environments, baselines, published hyperparameters, and sim-to-real
-recipes. Choosing Genesis means writing more of that yourself.
+- **Grasp stability is sharply grip-force sensitive** — 0.5 N holds, 5 N ejects
+  the cube, where real hardware would hold comfortably. Genesis warns
+  `Approximating tendon by joint actuator for finger_joint1`: it models the
+  Panda's mechanically coupled fingers as independent actuators, so asymmetric
+  contact builds a lateral impulse that pops the object out. Whether this
+  generalizes to a custom micro-gripper model is untested, but it is a caution
+  about contact-parameter sensitivity in exactly the regime you care about.
+- **Contact resolution itself is good** at macro scale — sub-0.1 mm penetration,
+  under 1 cm drift through a 23 cm lift.
+- **Headless needs work** — `scene.build()` constructs the rasterizer
+  unconditionally even with `show_viewer=False` and no cameras; needs
+  `libosmesa6` + `PYOPENGL_PLATFORM=osmesa` on a GPU-less box.
+- **Version churn** — v1.0.0 (late May 2026) → v1.3.0 (July 2026), with friction
+  and contact semantics changing in three of four releases. Pin the version.
+- **Open contact bugs** — friction vector changes reportedly not affecting contact
+  behavior (Genesis #1139); gripper cannot hold cloth (genesis-world #199).
 
 ---
 
-## 5. Head-to-head for the fine-grasping tier
+## 3. How the micro scope changes the case for Genesis
 
-| Criterion | Genesis 1.3 | MuJoCo (Warp / 3.5) | Isaac Lab + Newton 1.0 |
-|---|---|---|---|
-| Contact accuracy, rigid | Good; sub-0.1 mm penetration measured; friction model recently overhauled | Gold standard, years of validation | Strong; Newton GA targets contact-rich |
-| Intersection-free / IPC | **Yes (uipc + articulation constraint)** | No | No |
-| Tactile / taxel sensing | **Best in class, in-engine, batched, with hysteresis + crosstalk** | Build it yourself | Build it yourself; strong vision instead |
-| Deformables coupled to rigid | **Yes, one scene, one state** | Limited | Improving (cloth via Newton) |
-| Differentiable | Yes (rigid, no longer experimental) | MJX via JAX | Limited |
-| GPU throughput | Good, claims unreliable | **Excellent (MJWarp)** | **Excellent** |
-| Photorealistic vision | Good | Batch renderer, improving | **Best in class (RTX, tiled)** |
-| Maturity / API stability | **Weakest** — 4 minor releases in 2 months | **Strongest** | Strong, GA |
-| Ecosystem / baselines | Thin | Deep (Playground) | Deep (Isaac Lab) |
-| Sim-to-real track record for grasping | Narrow, promising | Extensive | Extensive |
-| License | Apache 2.0 | Apache 2.0 | Mixed / NVIDIA-tied |
+### Weakened
+
+**The tactile-array argument, which was the strongest pro-Genesis point in the
+general case, largely does not apply here.** Genesis's standout capability is
+batched per-taxel tactile sensing (`ElastomerTaxel`, `KinematicTaxel`,
+`ProximityTaxel`, with viscoelastic hysteresis and spatial crosstalk), validated
+by *Tactile Genesis* on a 20 000-environment XHand study with real-hardware
+transfer. That is a **multi-finger-hand** capability. Watch assembly under a
+microscope uses tweezers and micro-grippers; there is no taxel array to simulate,
+and the Tactile Genesis findings (whole-hand coverage beats fingertip-only, ~200
+taxels suffice) do not transfer to this setting.
+
+Genesis's throughput story also matters less under **A4** — precision-dominated,
+quasi-static work does not need 20 000 parallel environments, and §2.1 shows the
+timestep you need would erode the advantage anyway.
+
+### Strengthened
+
+**Intersection-free IPC contact matters *more* here, not less.** §2.1 shows
+relative interpenetration is the characteristic micro-scale failure. Genesis's
+`uipc` integration with the External Articulation Constraint — which resolves
+joint-space and contact forces simultaneously and maintains intersection-free
+guarantees, with a barrier-free formulation reported up to 103× faster than
+classical IPC — attacks precisely that failure mode. This is now the **primary**
+technical argument for Genesis on this project.
+
+**FEM deformables become essential rather than nice-to-have.** A hairspring is a
+spiral of ~0.03 mm wire; a mainspring is a coiled elastic strip. These are not
+rigid bodies in any useful approximation. Genesis couples FEM/MPM/PBD to the rigid
+solver in one scene with one state. In MuJoCo or Isaac this is painful or absent.
+**If hairsprings and mainsprings are in scope, this may be decisive on its own.**
+
+**Differentiability** (rigid sim, non-experimental as of v1.3.0) is more valuable
+here than in the general case — the calibration problem in §1 is exactly a
+parameter-fitting problem: given real pick-and-release trials, fit the adhesion
+and friction parameters. Gradients help.
+
+**Torsional and rolling friction** (new in v1.3.0) matter for the rolling and
+pivoting contacts of small cylindrical parts.
 
 ---
 
-## 6. Recommendation
+## 4. The candidate Drake, which the first draft under-weighted
 
-**Tier the simulators; don't pick one.**
+For **precision-first, throughput-second** contact work, Drake is a serious
+contender and arguably a better fit than any of the RL-oriented engines:
 
-1. **Backbone (bulk RL, vision, locomotion, coarse pick-and-place):** MuJoCo Warp
-   or Isaac Lab + Newton. Mature, fast, deep ecosystem, well-understood transfer.
+- **Double precision throughout.** Not a flag — the design point. Given §2, this
+  is not a minor consideration.
+- **SAP (Semi-Analytic Primal) contact solver** with theoretically guaranteed
+  global convergence, stable at larger timesteps. (Notably, Genesis lists SAP
+  among its own solvers — the idea's provenance is Drake.)
+- **Hydroelastic contact** — a continuous pressure field over a finite contact
+  *patch* rather than a set of point contacts. For small parts with tight
+  tolerances this is far better conditioned than point contact, and it is the
+  model NVIDIA cites as inspiration for Newton's contact-rich work.
+- **Demonstrated on peg-in-hole insertion**, which is structurally the same
+  problem as setting a pivot into a jewel.
 
-2. **Fine / nimble grasping tier:** Genesis — *conditionally*, and specifically
-   when the research question involves tactile feedback, soft contact, or
-   deformables. If the fine-grasping work is really just tighter tolerances on
-   rigid objects, MuJoCo is the lower-risk answer and Genesis adds little.
-
-3. **Do not** make Genesis the single environment the whole program depends on
-   at this maturity level.
-
-The decision hinges on one question I can't answer from an empty repo: **is
-tactile sensing actually in scope?** If yes, Genesis is close to compelling and
-the integration cost is justified. If no, the case weakens sharply.
+Drake's cost: no massive parallel RL story, thinner learning ecosystem, steeper
+C++/Python systems framework, and no first-class deformables to speak of. If you
+need hairsprings, Drake alone won't do it.
 
 ---
 
-## 7. Proposed bake-off before committing
+## 5. Comparison for *this* task
 
-Two weeks, one engineer, GPU access. Genesis vs MuJoCo Warp on identical tasks.
+| Criterion (micro-assembly weighting) | Genesis 1.3 | Drake | MuJoCo (Warp) | Isaac Lab + Newton |
+|---|---|---|---|---|
+| Models the dominant micro physics (adhesion) | **No** | **No** | **No** | **No** |
+| Extensibility to inject custom force models | Good (Python, differentiable) | Good (force elements) | Good (callbacks/plugins) | Moderate |
+| Numerical conditioning at sub-mm | fp64 available; `mjMINVAL` floor via MJCF | **Double precision by design** | Same `mjMINVAL` floor | Untested here |
+| Intersection-free contact | **Yes (uipc + articulation)** | No (but hydroelastic patches) | No | No |
+| Contact model quality for precision fits | Good | **Hydroelastic — best fit** | Very good | Good |
+| Deformables (hairspring, mainspring) | **Yes, coupled, one scene** | Weak | Limited | Improving |
+| Differentiable | Yes | Partial (AutoDiff; not with SAP contact) | MJX | Limited |
+| Parallel RL throughput | Good | Weak | **Excellent** | **Excellent** |
+| Photoreal vision | Good | Weak | Improving | **Best** — but less relevant under a microscope |
+| Maturity / API stability | **Weakest** | **Strongest** | Strong | Strong |
+| License | Apache 2.0 | BSD-3 | Apache 2.0 | NVIDIA-tied |
 
-**Tasks** (increasing contact difficulty)
-1. Pinch-grasp and lift a rigid cube — baseline, must be boring.
-2. Grasp a thin object (card, washer, 2 mm plate) — tests tunneling and
-   intersection-free contact; expected Genesis win.
-3. In-hand pivot / reorientation — tests torsional and rolling friction (new in
-   v1.3.0).
-4. Grasp a deformable (sponge, cable) — Genesis-only capability in practice.
-5. Tactile-conditioned slip detection and regrasp — the actual differentiator.
+---
+
+## 6. What none of this solves
+
+Worth stating plainly before any recommendation: **you should not expect
+sim-to-real transfer for sub-0.1 mm manipulation from any of these tools without
+building custom physics.** The literature treats micro-scale capture and release
+as requiring explicit models of van der Waals, capillary, electrostatic, and
+pull-off forces. That work is yours to do regardless of engine.
+
+A realistic framing is a **two-regime project**:
+
+- **≥ ~1 mm** (plates, bridges, wheels, jewels, screws) — a stock engine with
+  rescaled units and a tightened timestep can be genuinely useful today.
+- **< ~0.1 mm** (pivots, hairsprings) — treat as a physics-modelling research
+  problem with a simulator as substrate, not as a simulation task.
+
+If the project's value is concentrated in the second regime, simulator choice is
+much less important than the adhesion-modelling work, and the honest
+recommendation is to prototype that model first, in whatever is quickest.
+
+---
+
+## 7. Recommendation
+
+**Split the decision by regime, and start with a rescaling spike, not an engine
+commitment.**
+
+1. **Before choosing anything — do the unit-rescaling spike (1–2 days).** Establish
+   the unit convention (mm-as-m, with gravity and time rescaled consistently) and
+   verify it clears `mjMINVAL` and holds contact accuracy at 0.1 mm. This work is
+   engine-independent and is a prerequisite for every option. Doing it first will
+   teach you more about the real constraints than any further comparison.
+
+2. **Primary recommendation: Genesis — but only if deformables are in scope.**
+   If hairsprings, mainsprings, or compliant micro-grippers are part of the target,
+   Genesis is the only candidate that does rigid + FEM + intersection-free IPC in
+   one scene, and that combination is the right shape for this problem. Accept the
+   maturity risk and pin the version.
+
+3. **If deformables are *not* in scope: prefer Drake.** For rigid micro-assembly
+   dominated by precision — pivot-into-jewel, screw placement, wheel seating —
+   Drake's double precision, SAP convergence guarantees, and hydroelastic contact
+   are a better match than Genesis's newer, faster-moving stack, and the RL
+   throughput you'd give up is not something A4 needs.
+
+4. **Do not choose Isaac Lab for this.** Its principal strengths — photorealistic
+   vision at scale, massive parallel RL — are the two things this task needs least.
+
+5. **MuJoCo remains the safe fallback** if ecosystem maturity outweighs everything,
+   but note it shares the `mjMINVAL` floor and lacks both IPC and deformables.
+
+**The question that decides between (2) and (3): are hairsprings and mainsprings
+in scope, or is this rigid-part assembly only?** I can't answer that from here,
+and it flips the recommendation.
+
+---
+
+## 8. Revised bake-off
+
+Three weeks, one engineer. Genesis vs Drake, on rescaled units from the start.
+
+**Step 0 — rescaling spike** (see §7.1). Gate: a 0.1 mm part builds and holds
+contact with <2% relative penetration.
+
+**Tasks, in increasing order of what they'd actually prove**
+1. Seat a 1 mm jewel into a bore — baseline precision fit.
+2. Insert a 0.1 mm pivot into a jewel hole — the real target; tests whether
+   relative-penetration control survives at the small end.
+3. Place and drive a 0.5 mm screw — threaded contact, torsional friction.
+4. Deform a hairspring — Genesis-only in practice; skip if out of scope.
+5. **Pick *and release* a 0.3 mm part with an injected adhesion model** — the
+   task that actually reflects §1.
 
 **Metrics**
-- Grasp success rate across object poses and masses.
-- **Sensitivity: success rate as a function of grip force and friction
-  coefficient.** Given §4.1, this is the headline metric, not success rate at one
-  tuned setpoint. A simulator whose success depends on a narrow force band is a
-  simulator that will not transfer.
-- Max penetration and contact-force realism vs. hardware measurement.
-- Wall-clock throughput **in the fidelity configuration you'd actually train in**.
-- Engineer-days to first working environment.
+- Relative penetration as a fraction of feature size (not absolute).
+- Placement accuracy vs. tolerance budget for the real assembly.
+- **Sensitivity of success to contact and friction parameters** — given §2.4, a
+  narrow band of working parameters is a red flag for transfer.
+- Wall-clock at the timestep micro-parts actually need (§2.1), not at defaults.
+- Engineer-days to inject a custom adhesion force.
 
-**Gates — Genesis proceeds to the fine tier only if:**
-- G1: grasp success ≥ 90% across a ≥ 5× grip-force range on task 1. *(Currently
-  failing: 0.5 N holds, 5 N ejects.)*
-- G2: issue #1139 is resolved or a working friction-control path is demonstrated.
-- G3: tasks 2 and 5 are demonstrably easier in Genesis than in MuJoCo — i.e. the
-  differentiator is real, not theoretical.
-- G4: a pinned version runs headless in CI without per-node GL hacks.
-
-If G1 fails and cannot be tuned away, Genesis is not ready for *fine* grasping
-regardless of how good the tactile story is.
+**Gates**
+- G1: unit convention clears `mjMINVAL` for the smallest target part.
+- G2: <2% relative penetration at 0.1 mm at a tractable timestep.
+- G3: a custom adhesion/pull-off force can be injected and calibrated — if this
+  is hard in an engine, that engine is disqualified for the sub-0.1 mm regime
+  regardless of its other merits.
+- G4: success rate stable across a ≥5× range of contact-stiffness and friction
+  parameters.
+- G5 (Genesis only): pinned version runs headless in CI without per-node GL hacks.
 
 ---
 
-## 8. Reproducing the measurements here
+## 9. Reproducing
 
 ```bash
 python -m venv venv && ./venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 ./venv/bin/pip install genesis-world==1.3.0
-sudo apt-get install -y libosmesa6          # headless only; see §4.4
+sudo apt-get install -y libosmesa6            # headless only
+
+# scale sweep -- part side in mm, precision 32|64
+PYOPENGL_PLATFORM=osmesa ./venv/bin/python experiments/genesis_scale_limit.py 40 32
+PYOPENGL_PLATFORM=osmesa ./venv/bin/python experiments/genesis_scale_limit.py 1 32
+PYOPENGL_PLATFORM=osmesa ./venv/bin/python experiments/genesis_scale_limit.py 0.3 32   # mjMINVAL
+
+# macro grasp-force sensitivity
 PYOPENGL_PLATFORM=osmesa ./venv/bin/python experiments/genesis_grasp_smoke.py force -0.5
 PYOPENGL_PLATFORM=osmesa ./venv/bin/python experiments/genesis_grasp_smoke.py force -5.0
 ```
 
-Measured on CPU only (no GPU in the evaluation container): 183–691 steps/s for a
-single Franka + cube environment depending on timestep and substep count. **These
-are not throughput guidance** — they exist only to confirm the engine runs and to
-support the grasp-stability finding.
-
 ---
 
-## 9. Open questions
+## 10. Open questions
 
-1. Where is the actual plan, and what simulation options were already proposed?
-2. Is tactile sensing in scope? This is the deciding question (§6).
-3. What is the target hardware — parallel-jaw gripper, or a multi-finger hand
-   like the XHand/Allegro? The Tactile Genesis evidence is hand-specific.
-4. Are deformable objects in scope?
-5. Is there physical hardware to validate against, or is this sim-only for now?
+1. **Are hairsprings/mainsprings in scope?** Decides Genesis vs Drake (§7).
+2. **What is the smallest part you need to manipulate?** If ≥1 mm, this is a
+   tractable simulation project. If 0.1 mm, it is a physics-modelling project.
+3. **Is the end effector a tweezer/micro-gripper, or a multi-finger hand?** A
+   hand would revive the tactile argument and swing this back to Genesis.
+4. **Is there real hardware to calibrate an adhesion model against?** Without it,
+   the sub-0.1 mm regime cannot be validated.
+5. **Is this RL-driven, or planning/control-driven?** RL would re-weight
+   throughput, which currently barely features in the recommendation.
+6. Where is the actual plan, and what options were already proposed?
 
 ---
 
 ## Sources
 
-- [Genesis-Embodied-AI/genesis-world (GitHub)](https://github.com/Genesis-Embodied-AI/genesis-world)
-- [genesis-world releases](https://github.com/Genesis-Embodied-AI/genesis-world/releases)
+- [Genesis-Embodied-AI/genesis-world](https://github.com/Genesis-Embodied-AI/genesis-world) · [releases](https://github.com/Genesis-Embodied-AI/genesis-world/releases)
 - [Tactile Genesis: Exploring Tactile Sensors at Scale for Learning Dexterous Tasks (arXiv 2606.22332)](https://arxiv.org/abs/2606.22332)
-- [The Role of Simulation in Scalable Robotics, Genesis World 1.0, and the Path Forward (Genesis AI)](https://www.genesis.ai/blog/the-role-of-simulation-in-scalable-robotics-genesis-world-10-and-the-path-forward)
-- [Genesis AI Releases Nyx, Quadrants, and Genesis World 1.0 (MarkTechPost)](https://www.marktechpost.com/2026/05/30/genesis-ai-releases-nyx-quadrants-and-genesis-world-1-0-physics-platform-for-scalable-robotics-foundation-model-evaluation/)
-- [Genesis speed claims discussion — google-deepmind/mujoco #2303](https://github.com/google-deepmind/mujoco/discussions/2303)
-- [Bug: changing friction vector doesn't affect contact behavior — Genesis #1139](https://github.com/Genesis-Embodied-AI/Genesis/issues/1139)
-- [Robot gripper cannot grasp cloth (slipping) — genesis-world #199](https://github.com/Genesis-Embodied-AI/genesis-world/issues/199)
-- [MuJoCo Warp (MJWarp) documentation](https://mujoco.readthedocs.io/en/latest/mjwarp/)
-- [google-deepmind/mujoco_warp](https://github.com/google-deepmind/mujoco_warp)
+- [The Role of Simulation in Scalable Robotics, Genesis World 1.0 (Genesis AI)](https://www.genesis.ai/blog/the-role-of-simulation-in-scalable-robotics-genesis-world-10-and-the-path-forward)
+- [Genesis speed-claim discussion — google-deepmind/mujoco #2303](https://github.com/google-deepmind/mujoco/discussions/2303)
+- [Friction vector doesn't affect contact behavior — Genesis #1139](https://github.com/Genesis-Embodied-AI/Genesis/issues/1139)
+- [Gripper cannot grasp cloth — genesis-world #199](https://github.com/Genesis-Embodied-AI/genesis-world/issues/199)
+- [Drake: Modeling Compliant Contact](https://drake.mit.edu/doxygen_cxx/group__compliant__contact.html) · [hydroelastic contact tutorial](https://github.com/RobotLocomotion/drake/blob/master/tutorials/hydroelastic_contact_basics.ipynb)
+- [Irrotational Contact Fields (arXiv 2312.03908)](https://arxiv.org/html/2312.03908v3)
+- [Micro-Manipulation and Adhesion Forces (Springer)](https://link.springer.com/chapter/10.1007/978-3-7091-2498-7_28)
+- [Adhesion force modeling and measurement for micromanipulation (SPIE)](https://www.spiedigitallibrary.org/conference-proceedings-of-spie/3519/1/Adhesion-force-modeling-and-measurement-for-micromanipulation/10.1117/12.325737.short)
+- [Manipulation of Microobjects Based on Dynamic Adhesion Control](https://journals.sagepub.com/doi/10.5772/51507)
+- [Microassembly: A Review on Fundamentals, Applications and Recent Developments](https://www.engineering.org.cn/engi/EN/1159991032756626078)
 - [Newton Adds Contact-Rich Manipulation and Locomotion Capabilities (NVIDIA)](https://developer.nvidia.com/blog/newton-adds-contact-rich-manipulation-and-locomotion-capabilities-for-industrial-robotics/)
-- [Isaac Lab: A GPU-Accelerated Simulation Framework for Multi-Modal Robot Learning (arXiv 2511.04831)](https://arxiv.org/pdf/2511.04831)
-- [A Survey of Robotic Navigation and Manipulation with Physics Simulators in the Era of Embodied AI (arXiv 2505.01458)](https://arxiv.org/html/2505.01458v1)
+- [MuJoCo Warp (MJWarp)](https://mujoco.readthedocs.io/en/latest/mjwarp/)
